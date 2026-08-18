@@ -1182,6 +1182,7 @@ impl SessionManager {
     }
 
     async fn prewarm_inner(self: &Arc<Self>, app: AppHandle, force: bool) {
+        let attempt_started = Instant::now();
         // Quick gate (no connect_lock — connect may be awaiting a Spawning
         // prewarm; grabbing the lock here would deadlock it). The prewarm
         // Mutex serializes concurrent prewarm calls.
@@ -1198,7 +1199,7 @@ impl SessionManager {
                 if let PrewarmState::Ready(p) = std::mem::replace(
                     &mut *pw,
                     PrewarmState::Spawning {
-                        since: Instant::now(),
+                        since: attempt_started,
                     },
                 ) {
                     tokio::spawn(async move {
@@ -1222,7 +1223,7 @@ impl SessionManager {
                     return;
                 }
                 *pw = PrewarmState::Spawning {
-                    since: Instant::now(),
+                    since: attempt_started,
                 };
             }
         }
@@ -1234,7 +1235,7 @@ impl SessionManager {
             settings.manual_cli_path.as_deref(),
         );
         let Some(cli_path) = probe.path else {
-            *self.prewarm.lock() = PrewarmState::None;
+            self.clear_prewarm_attempt(attempt_started);
             return;
         };
         let cli_path = std::path::PathBuf::from(cli_path);
@@ -1269,7 +1270,7 @@ impl SessionManager {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(code = e.code.as_str(), error = %e.message, "prewarm spawn failed");
-                *self.prewarm.lock() = PrewarmState::None;
+                self.clear_prewarm_attempt(attempt_started);
                 return;
             }
         };
@@ -1288,20 +1289,40 @@ impl SessionManager {
         if let Err(e) = client.initialize_and_auth().await {
             tracing::warn!(code = e.code.as_str(), error = %e.message, "prewarm init failed");
             client.kill().await;
-            *self.prewarm.lock() = PrewarmState::None;
+            self.clear_prewarm_attempt(attempt_started);
             return;
         }
-        *self.prewarm.lock() = PrewarmState::Ready(PrewarmedProcess {
-            acp: client,
-            process_id,
-            policy,
-            effort: Some(prefs.effort),
-            sandbox_profile: Some(effective_sandbox),
-            model_id: Some(prefs.model_id),
-            created_at: Instant::now(),
-            backend: "grok_agent_stdio".into(),
-        });
+        let installed = {
+            let mut slot = self.prewarm.lock();
+            if prewarm_attempt_is_current(&slot, attempt_started) {
+                *slot = PrewarmState::Ready(PrewarmedProcess {
+                    acp: client.clone(),
+                    process_id,
+                    policy,
+                    effort: Some(prefs.effort),
+                    sandbox_profile: Some(effective_sandbox),
+                    model_id: Some(prefs.model_id),
+                    created_at: Instant::now(),
+                    backend: "grok_agent_stdio".into(),
+                });
+                true
+            } else {
+                false
+            }
+        };
+        if !installed {
+            tracing::info!("prewarm discarded after auth/route recycle");
+            client.kill().await;
+            return;
+        }
         tracing::info!(target: "session", "prewarm ready (spawn+init+auth, no session)");
+    }
+
+    fn clear_prewarm_attempt(&self, attempt_started: Instant) {
+        let mut slot = self.prewarm.lock();
+        if prewarm_attempt_is_current(&slot, attempt_started) {
+            *slot = PrewarmState::None;
+        }
     }
 
     /// Reap a dead prewarm process. Prewarm is intentionally persistent
@@ -1456,6 +1477,10 @@ pub(crate) fn should_kill_parked_after_flag_mismatch(
     busy_process_ids: &HashSet<String>,
 ) -> bool {
     !process_blocked_for_warm_reuse(process_id, busy_process_ids)
+}
+
+fn prewarm_attempt_is_current(state: &PrewarmState, attempt_started: Instant) -> bool {
+    matches!(state, PrewarmState::Spawning { since } if *since == attempt_started)
 }
 
 #[cfg(test)]
@@ -1685,6 +1710,19 @@ mod reuse_gate_tests {
             "off",
             true,
         ));
+    }
+
+    #[test]
+    fn cancelled_prewarm_attempt_cannot_become_ready() {
+        let started = Instant::now();
+        let current = PrewarmState::Spawning { since: started };
+        assert!(prewarm_attempt_is_current(&current, started));
+        assert!(!prewarm_attempt_is_current(&PrewarmState::None, started));
+
+        let newer = PrewarmState::Spawning {
+            since: started + Duration::from_nanos(1),
+        };
+        assert!(!prewarm_attempt_is_current(&newer, started));
     }
 
     #[test]

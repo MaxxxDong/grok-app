@@ -285,6 +285,7 @@ import {
   type GoalOrchEvent
 } from "@/lib/goalOrch";
 import * as api from "@/lib/api";
+import { queueComposerPreferenceApply } from "@/lib/composerPrefsBarrier";
 import {
   DEFAULT_SANDBOX_PROFILE,
   SANDBOX_PROFILES,
@@ -2577,6 +2578,8 @@ export function AppWorkbench() {
   const [connecting, setConnecting] = useState(false);
   /** Sync gate for ensureConnected (React state alone races two rapid sends). */
   const connectingRef = useRef(false);
+  /** Effort changes respawn the CLI; sends must wait for that write to settle. */
+  const effortApplyRef = useRef<Promise<void>>(Promise.resolve());
   /** Live provider retry progress (session://retry); cleared on success/stop/error. */
   // Value intentionally unbound (retry chip hidden): only the setter is kept
   // for cleanup calls. See the hidden-retry comment at the status-pill site.
@@ -7722,6 +7725,7 @@ export function AppWorkbench() {
     sendInFlightRef.current = true;
     const sendEpoch = ++sendEpochRef.current;
     const { storedDisplay, att, goalMode: useGoal, fromQueue } = opts;
+    if (!fromQueue) await effortApplyRef.current;
     const segments = parseStoredContent(storedDisplay);
     if (isDraftEmpty(segments) && !att.length) {
       sendInFlightRef.current = false;
@@ -12233,6 +12237,24 @@ export function AppWorkbench() {
     );
     if (next !== effort) setEffort(next);
   }, [activeEffortCatalog, effort]);
+
+  const handleEffortPick = useCallback(
+    (nextEffort: string) => {
+      if (!isValidEffort(nextEffort, activeEffortCatalog)) return;
+      setEffort(nextEffort);
+      effortApplyRef.current = queueComposerPreferenceApply(
+        effortApplyRef.current,
+        () =>
+          api.composerPrefsSet({
+            projectId: activeProject?.id ?? null,
+            sessionId: session.sessionId ?? null,
+            effort: nextEffort,
+          }),
+        (error) => showToast(String(error), 4000),
+      );
+    },
+    [activeEffortCatalog, activeProject?.id, session.sessionId, showToast],
+  );
 
   const handleModelPick = useCallback(
     async (pick: ComposerModelPick) => {
@@ -20848,17 +20870,7 @@ export function AppWorkbench() {
                       onModelPick={(pick) => {
                         void handleModelPick(pick);
                       }}
-                      onEffort={(v) => {
-                        if (!isValidEffort(v, activeEffortCatalog)) return;
-                        setEffort(v);
-                        void api
-                          .composerPrefsSet({
-                            projectId: activeProject?.id ?? null,
-                            sessionId: session.sessionId ?? null,
-                            effort: v,
-                          })
-                          .catch((e) => showToast(String(e), 4000));
-                      }}
+                      onEffort={handleEffortPick}
                     />
                     <ComposerAccessMenu
                       mode={mode}
@@ -21201,17 +21213,7 @@ export function AppWorkbench() {
             onModelPick={(pick) => {
               void handleModelPick(pick);
             }}
-            onEffort={(v) => {
-              if (!isValidEffort(v, activeEffortCatalog)) return;
-              setEffort(v);
-              void api
-                .composerPrefsSet({
-                  projectId: activeProject?.id ?? null,
-                  sessionId: session.sessionId ?? null,
-                  effort: v,
-                })
-                .catch((e) => showToast(String(e), 4000));
-            }}
+            onEffort={handleEffortPick}
             onMode={(v) => {
               setMode(v);
               if (v === "plan") setGoalMode(false);
